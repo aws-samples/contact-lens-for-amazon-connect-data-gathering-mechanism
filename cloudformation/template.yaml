@@ -1,0 +1,415 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  Project:
+    Description: Name of the project
+    Type: String
+    AllowedPattern: "[a-zA-Z0-9-]+"
+  S3SourceBucket:
+    Description: Name of your Amazon S3 bucket
+    Type: String
+    AllowedPattern: "[a-zA-Z0-9-]+"
+Resources:
+  LambdaPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Join ["-", [!Ref Project, 'lambda-policy' ] ]
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - s3:PutObject
+              - s3:GetObject
+            Resource:
+              - !Join [':', [ 'arn:aws:logs', !Ref 'AWS::Region', !Ref 'AWS::AccountId', '*' ] ]
+              - !Join ['', [ 'arn:aws:s3:::', !Ref S3SourceBucket, '/*' ] ]
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Join ['', [ 'arn:aws:logs:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':log-group:/aws/lambda/', !Ref Project, '-*:*' ] ]
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ["-", [!Ref Project, 'lambda-role' ] ]
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref LambdaPolicy
+  CallTransformer:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join ["-", [!Ref Project, 'call-transformer' ] ]
+      ReservedConcurrentExecutions: 10
+      Code:
+        ZipFile: |
+          # -*- coding: utf-8 -*-
+          """
+          Created on Fri May 14 2021
+
+          @author: Michael Wallner (Amazon Web Services)
+          @email: wallnm@amazon.com
+          """
+          import json
+          import urllib.parse
+          import boto3
+          import copy
+
+          # Boto3 client
+          s3 = boto3.client('s3')
+
+          # Table headers
+          header = [
+              'JobStatus',
+              'LanguageCode',
+              'TotalConversationDurationMillis',
+              'TotalTimeMillis',
+              'AverageWordsPerMinute_Agent',
+              'AverageWordsPerMinute_Customer',
+              'ContactId',
+              'Content',
+              'ParticipantId',
+              'Id'
+          ]
+
+          def lambda_handler(event, context):
+              """General Lambda entry point to run the Lambda function.
+
+              Args:
+                  event (dict): A dictionary with the event tags coming from Connect.
+                  context (dict): A dictionary with context tags.
+
+              Returns:
+                  output (dict): A dictionary with the status and results body.
+
+              """
+              # Get the object from the event and show its content type
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+              # Set voice key, loudness key and kendra object key
+              voice_key = "content/voice/{}.csv".format(key.split("/")[-1].split(".")[0])
+              loudness_key = "content/loudness/{}.csv".format(key.split("/")[-1].split(".")[0])
+              kendra_key = "content/kendra/{}.html".format(key.split("/")[-1].split(".")[0])
+              # Try-catch
+              try:
+                  # Read from S3
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  data = json.loads(response["Body"].read().decode("utf-8"))
+                  # Parse from S3
+                  df = {}
+                  loudness = {}
+                  df["JobStatus"] = data["JobStatus"]
+                  df["LanguageCode"] = data["LanguageCode"]
+                  df["TotalConversationDurationMillis"] = data["ConversationCharacteristics"]["TotalConversationDurationMillis"]
+                  df["TotalTimeMillis"] = data["ConversationCharacteristics"]["NonTalkTime"]["TotalTimeMillis"]
+                  df["AverageWordsPerMinute_Agent"] = data["ConversationCharacteristics"]["TalkSpeed"]["DetailsByParticipant"]["AGENT"]["AverageWordsPerMinute"]
+                  df["AverageWordsPerMinute_Customer"] = data["ConversationCharacteristics"]["TalkSpeed"]["DetailsByParticipant"]["CUSTOMER"]["AverageWordsPerMinute"]
+                  df["ContactId"] = data["CustomerMetadata"]["ContactId"]
+                  loudness["ContactId"] = data["CustomerMetadata"]["ContactId"]
+                  file = ";".join(list(header))
+                  kendra = "<html><h1>Contact ID: {}</h1>\n\n<h2>Conversation</h2>\n".format(data["CustomerMetadata"]["ContactId"])
+                  for item in data['Transcript']:
+                      df["Content"] = item["Content"]
+                      df["ParticipantId"] = item["ParticipantId"]
+                      df["Id"] = item["Id"]
+                      kendra += ("<p>{}: {}</p>\n".format(item["ParticipantId"], item["Content"]))
+                      loudness["Id"] = item["Id"]
+                      loudness["LoudnessScore"] = item["LoudnessScore"]
+                      file += ("\n{}".format(";".join([str(df[key]) for key in df])))
+                  kendra += "</html>"
+                  # Write to S3
+                  response = s3.put_object(Bucket=bucket, Key=voice_key, Body=file)
+                  response = s3.put_object(Bucket=bucket, Key=kendra_key, Body=kendra)
+                  response = s3.put_object(Bucket=bucket, Key=loudness_key, Body=json.dumps(loudness))
+                  return {
+                      "Status": "Success!"
+                  }
+              except Exception as e:
+                  print(e)
+                  print('Error getting object {} from bucket {}. Make sure they exist and your bucket is in the same region as this function.'.format(key, bucket))
+                  raise e
+      Timeout: 30
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Role: !GetAtt LambdaRole.Arn
+  ChatTransformer:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join ["-", [!Ref Project, 'chat-transformer' ] ]
+      ReservedConcurrentExecutions: 10
+      Code:
+        ZipFile: |
+          # -*- coding: utf-8 -*-
+          """
+          Created on Fri May 14 2021
+
+          @author: Michael Wallner (Amazon Web Services)
+          @email: wallnm@amazon.com
+          """
+          import json
+          import urllib.parse
+          import boto3
+          import copy
+
+          # Boto3 client
+          s3 = boto3.client('s3')
+
+          # Table headers
+          header = [
+              "ContactId",
+              "Content",
+              "ParticipantRole",
+              "AbsoluteTime"
+          ]
+
+          def lambda_handler(event, context):
+              """General Lambda entry point to run the Lambda function.
+
+              Args:
+                  event (dict): A dictionary with the event tags coming from Connect.
+                  context (dict): A dictionary with context tags.
+
+              Returns:
+                  output (dict): A dictionary with the status and results body.
+
+              """
+              # Get the object from the event and show its content type
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+              # Set new key and kendra object key
+              new_key = "content/chat/{}.csv".format(key.split("/")[-1].split(".")[0])
+              kendra_key = "content/kendra/{}.html".format(key.split("/")[-1].split(".")[0])
+              # Try-catch
+              try:
+                  # Read from S3
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  data = json.loads(response["Body"].read().decode("utf-8"))
+                  # Parse from S3
+                  df = {}
+                  df["ContactId"] = data["ContactId"]
+                  file = ";".join(list(header))
+                  kendra = "<html><h1>Contact ID: {}</h1>\n\n<h2>Conversation</h2>\n".format(data["ContactId"])
+                  message_cnt = 0 # check whether a message was included
+                  for item in data['Transcript']:
+                      # Only if messages are included add data entries
+                      if item["Type"] == "MESSAGE":
+                          message_cnt += 1
+                          df["Content"] = item["Content"]
+                          df["ParticipantRole"] = item["ParticipantRole"]
+                          df["AbsoluteTime"] = item["AbsoluteTime"]
+                          kendra += ("<p>{}: {}</p>\n".format(item["ParticipantRole"], item["Content"]))
+                          file += ("\n{}".format(";".join([str(df[key]) for key in df])))
+                  kendra += "</html>"
+                  if message_cnt > 0:
+                      # Write to S3
+                      response = s3.put_object(Bucket=bucket, Key=new_key, Body=file)
+                      response = s3.put_object(Bucket=bucket, Key=kendra_key, Body=kendra)
+                  return {
+                      "Status": "Success!"
+                  }
+              except Exception as e:
+                  print(e)
+                  print('Error getting object {} from bucket {}. Make sure they exist and your bucket is in the same region as this function.'.format(key, bucket))
+                  raise e
+      Timeout: 30
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      MemorySize: 128
+      Role: !GetAtt LambdaRole.Arn
+  CrawlerPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Join ["-", [!Ref Project, 'glue-crawler-policy' ] ]
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource:
+              - !Join ['', [ 'arn:aws:s3:::', !Ref S3SourceBucket, '/*' ] ]
+  CrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ["-", [!Ref Project, 'glue-crawler-role' ] ]
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref CrawlerPolicy
+        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+  CrawlerDB:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Join ["-", [!Ref Project, 'insights' ] ]
+        Description: "Amazon Connect data gathering database"
+  TheCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Join ["-", [!Ref Project, 'insights-crawler' ] ]
+      Role: !GetAtt CrawlerRole.Arn
+      DatabaseName: !Ref CrawlerDB
+      Targets:
+        S3Targets:
+          - Path: !Ref S3SourceBucket
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Schedule:
+        ScheduleExpression: "cron(0 10 * * ? *)"
+  ChatEventTrigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ChatTransformer.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Join ["", [ "arn:aws:s3:::", !Ref S3SourceBucket ] ]
+  CallEventTrigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CallTransformer.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Join ["", [ "arn:aws:s3:::", !Ref S3SourceBucket ] ]
+  TheS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3SourceBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Function: !GetAtt ChatTransformer.Arn
+            Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: ".json"
+                  - Name: prefix
+                    Value: connect/
+          - Function: !GetAtt CallTransformer.Arn
+            Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: ".json"
+                  - Name: prefix
+                    Value: Analysis/Voice/20
+  KendraIndexPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Join ["-", [!Ref Project, 'kendra-index-policy' ] ]
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+              - logs:DescribeLogGroups
+            Resource:
+              - !Join [':', [ 'arn:aws:logs', !Ref 'AWS::Region', !Ref 'AWS::AccountId', '*' ] ]
+              - !Join [':', [ 'arn:aws:cloudwatch', !Ref 'AWS::Region', !Ref 'AWS::AccountId', '*' ] ]
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kendra/*"
+          - Effect: Allow
+            Action:
+              - logs:DescribeLogStreams
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kendra/*:log-stream:*"
+  KendraIndexRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ["-", [!Ref Project, 'kendra-index-role' ] ]
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - kendra.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref KendraIndexPolicy
+  KendraDataPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Join ["-", [!Ref Project, 'kendra-data-policy' ] ]
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Join ['', [ !GetAtt TheS3Bucket.Arn, '/*' ] ]
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource: !GetAtt TheS3Bucket.Arn
+          - Effect: Allow
+            Action:
+              - kendra:BatchPutDocument
+              - kendra:BatchDeleteDocument
+            Resource:
+              - !Sub 
+                - "arn:aws:kendra:${AWS::Region}:${AWS::AccountId}:index/{index}"
+                - { index: !Ref KendraIndex }
+  KendraDataRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ["-", [!Ref Project, 'kendra-data-role' ] ]
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - kendra.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref KendraDataPolicy
+  KendraIndex:
+    Type: AWS::Kendra::Index
+    Properties: 
+      Description: "Knowledge base index"
+      Edition: DEVELOPER_EDITION
+      Name: !Join ["-", [!Ref Project, 'index' ] ]
+      RoleArn: !GetAtt KendraIndexRole.Arn
+  KendraDataSource:
+    Type: AWS::Kendra::DataSource
+    Properties: 
+      Name: !Join ["-", [!Ref Project, 'data-source' ] ]
+      Description: "Knowledge base data source"
+      IndexId: !Ref KendraIndex
+      RoleArn: !GetAtt KendraDataRole.Arn
+      Type: S3
+      DataSourceConfiguration:
+        S3Configuration:
+          BucketName: !Ref S3SourceBucket
+          InclusionPrefixes:
+            - content/kendra
+      Schedule: cron(0 10 * * ? *)
