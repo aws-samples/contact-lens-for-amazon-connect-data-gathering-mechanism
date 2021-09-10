@@ -21,8 +21,7 @@ Your Amazon Kendra data source is scheduled to update itself every day at 10 AM.
 
 As a first step, we want to deploy all resources, except for the Amazon Connect instance, using an AWS CloudFormation template. You can do this by choosing Launch Stack:
 
-![alt text](images/2-LaunchStack.jpg "Launch Stack")
-
+[![name](images/2-LaunchStack.jpg "Launch Stack")](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/template?stackName=clarifysklearn&templateURL=https://aws-ml-blog.s3.amazonaws.com/artifacts/ml4238_Amazon_Connect_as_data_gathering_mechanism/template.yaml)
 
 Define the name of your new S3 bucket and project.
 
